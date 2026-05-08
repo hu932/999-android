@@ -1,6 +1,5 @@
 package com.codex.shopeetaskhook;
 
-import android.app.Activity;
 import android.app.Application;
 import android.os.Handler;
 import android.os.Looper;
@@ -20,46 +19,27 @@ public class MainHook implements IXposedHookLoadPackage {
 
     private static final String TARGET_PACKAGE = "com.shopee.tw";
     private static final String TAG = "ShopeeTaskHook";
-    private volatile boolean initialized = false;
 
     @Override
     public void handleLoadPackage(XC_LoadPackage.LoadPackageParam lpparam) {
         if (!lpparam.packageName.equals(TARGET_PACKAGE)) return;
+        if (lpparam.processName != null && !lpparam.processName.equals(TARGET_PACKAGE)) return;
 
-        if (lpparam.processName != null && !lpparam.processName.equals(TARGET_PACKAGE)) {
-            return;
-        }
+        XposedBridge.log(TAG + ": loaded, will init in 15s");
 
-        XposedBridge.log(TAG + ": module loaded pid=" + android.os.Process.myPid());
-
-        try {
-            XposedHelpers.findAndHookMethod(Activity.class, "onResume", new XC_MethodHook() {
-                @Override
-                protected void afterHookedMethod(MethodHookParam param) {
-                    try {
-                        if (initialized) return;
-                        Activity activity = (Activity) param.thisObject;
-                        if (!activity.getPackageName().equals(TARGET_PACKAGE)) return;
-                        initialized = true;
-
-                        XposedBridge.log(TAG + ": first activity: " + activity.getClass().getName());
-                        Application app = activity.getApplication();
-
-                        new Handler(Looper.getMainLooper()).postDelayed(() -> {
-                            try {
-                                doInit(app, lpparam.classLoader);
-                            } catch (Throwable t) {
-                                XposedBridge.log(TAG + ": init error: " + t.getMessage());
-                            }
-                        }, 5000);
-                    } catch (Throwable t) {
-                        XposedBridge.log(TAG + ": onResume hook error: " + t.getMessage());
-                    }
+        new Handler(Looper.getMainLooper()).postDelayed(() -> {
+            try {
+                Class<?> atClass = Class.forName("android.app.ActivityThread");
+                Object app = atClass.getMethod("currentApplication").invoke(null);
+                if (app == null) {
+                    XposedBridge.log(TAG + ": no Application context");
+                    return;
                 }
-            });
-        } catch (Throwable t) {
-            XposedBridge.log(TAG + ": hook setup error: " + t.getMessage());
-        }
+                doInit((Application) app, lpparam.classLoader);
+            } catch (Throwable t) {
+                XposedBridge.log(TAG + ": delayed init error: " + t.getMessage());
+            }
+        }, 15000);
     }
 
     private void doInit(Application app, ClassLoader classLoader) {
@@ -101,7 +81,6 @@ public class MainHook implements IXposedHookLoadPackage {
                     }
                 }
             });
-
             XposedBridge.log(TAG + ": OkHttp hook installed");
         } catch (Throwable t) {
             XposedBridge.log(TAG + ": OkHttp hook failed: " + t.getMessage());
@@ -124,11 +103,9 @@ public class MainHook implements IXposedHookLoadPackage {
                     if (!"intercept".equals(methodName)) return null;
 
                     Object chain = args[0];
-                    Method requestMethod = chainClass.getMethod("request");
-                    Object request = requestMethod.invoke(chain);
-                    Method proceedMethod = chainClass.getMethod("proceed",
-                            XposedHelpers.findClass("okhttp3.Request", classLoader));
-                    Object response = proceedMethod.invoke(chain, request);
+                    Object request = chainClass.getMethod("request").invoke(chain);
+                    Object response = chainClass.getMethod("proceed",
+                            XposedHelpers.findClass("okhttp3.Request", classLoader)).invoke(chain, request);
 
                     try {
                         inspectOkHttpResponse(response, request, classLoader);
@@ -151,8 +128,7 @@ public class MainHook implements IXposedHookLoadPackage {
     }
 
     private void inspectOkHttpResponse(Object response, Object request, ClassLoader classLoader) throws Throwable {
-        Object requestUrl = XposedHelpers.callMethod(request, "url");
-        String urlString = requestUrl.toString();
+        String urlString = XposedHelpers.callMethod(request, "url").toString();
         if (!urlString.contains("/api/v4/pdp/")) return;
 
         Object body = XposedHelpers.callMethod(response, "body");
@@ -175,12 +151,10 @@ public class MainHook implements IXposedHookLoadPackage {
     private void installOkHttpFallbackHook(ClassLoader classLoader) {
         try {
             Class<?> realCallClass = null;
-            String[] candidates = {
+            for (String name : new String[]{
                     "okhttp3.internal.connection.RealCall",
                     "okhttp3.RealCall",
-                    "okhttp3.internal.http.RealInterceptorChain"
-            };
-            for (String name : candidates) {
+                    "okhttp3.internal.http.RealInterceptorChain"}) {
                 try {
                     realCallClass = XposedHelpers.findClass(name, classLoader);
                     break;
