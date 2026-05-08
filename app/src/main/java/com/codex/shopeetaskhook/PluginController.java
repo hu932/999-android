@@ -43,6 +43,7 @@ import java.util.Locale;
 import java.util.Random;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
 
 import de.robv.android.xposed.XposedBridge;
 
@@ -97,14 +98,24 @@ public class PluginController {
     private Runnable pendingCountdownRunnable;
     private long nextFireTime;
     private boolean overlayCreated;
+    private int overlayRetryCount;
 
     public static void init(Application app, ClassLoader classLoader) {
         if (instance != null) return;
         instance = new PluginController();
         instance.app = app;
         instance.appClassLoader = classLoader;
-        instance.loadDefaults();
-        instance.registerActivityLifecycle();
+        try {
+            instance.loadDefaults();
+        } catch (Throwable t) {
+            XposedBridge.log(TAG + ": loadDefaults error: " + t.getMessage());
+        }
+        try {
+            instance.registerActivityLifecycle();
+        } catch (Throwable t) {
+            XposedBridge.log(TAG + ": registerLifecycle error: " + t.getMessage());
+        }
+        XposedBridge.log(TAG + ": PluginController initialized");
     }
 
     public static PluginController getInstance() {
@@ -118,7 +129,14 @@ public class PluginController {
             @Override
             public void onActivityResumed(Activity a) {
                 if (overlayCreated) return;
-                mainHandler.postDelayed(() -> ensureOverlay(), 1500);
+                if (!a.getPackageName().equals("com.shopee.tw")) return;
+                mainHandler.postDelayed(() -> {
+                    try {
+                        ensureOverlay();
+                    } catch (Throwable t) {
+                        XposedBridge.log(TAG + ": ensureOverlay error: " + t.getMessage());
+                    }
+                }, 2000);
             }
             @Override public void onActivityPaused(Activity a) {}
             @Override public void onActivityStopped(Activity a) {}
@@ -176,15 +194,23 @@ public class PluginController {
         if (overlayCreated) return;
 
         if (!Settings.canDrawOverlays(app)) {
+            overlayRetryCount++;
+            if (overlayRetryCount > 3) {
+                XposedBridge.log(TAG + ": overlay permission denied after retries, give up");
+                return;
+            }
             executor.execute(() -> {
                 try {
                     Process p = Runtime.getRuntime().exec(new String[]{"su", "-c",
                             "appops set " + app.getPackageName() + " SYSTEM_ALERT_WINDOW allow"});
-                    p.waitFor();
+                    if (!p.waitFor(5, TimeUnit.SECONDS)) {
+                        p.destroyForcibly();
+                        XposedBridge.log(TAG + ": su timed out");
+                    }
                 } catch (Exception e) {
-                    XposedBridge.log(TAG + ": overlay permission error: " + e.getMessage());
+                    XposedBridge.log(TAG + ": overlay su error: " + e.getMessage());
                 }
-                mainHandler.postDelayed(this::ensureOverlay, 800);
+                mainHandler.postDelayed(this::ensureOverlay, 1000);
             });
             return;
         }
@@ -196,6 +222,7 @@ public class PluginController {
             buildBubble();
             buildMiniView();
             refreshUI();
+            XposedBridge.log(TAG + ": overlay created");
         } catch (Throwable t) {
             overlayCreated = false;
             XposedBridge.log(TAG + ": overlay build failed: " + t.getMessage());

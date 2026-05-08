@@ -1,6 +1,8 @@
 package com.codex.shopeetaskhook;
 
+import android.app.Activity;
 import android.app.Application;
+import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
 
@@ -19,12 +21,18 @@ public class MainHook implements IXposedHookLoadPackage {
 
     private static final String TARGET_PACKAGE = "com.shopee.tw";
     private static final String TAG = "ShopeeTaskHook";
+    private volatile boolean hooksInstalled = false;
 
     @Override
     public void handleLoadPackage(XC_LoadPackage.LoadPackageParam lpparam) {
         if (!lpparam.packageName.equals(TARGET_PACKAGE)) return;
 
-        XposedBridge.log(TAG + ": loaded in " + lpparam.packageName);
+        if (lpparam.processName != null && !lpparam.processName.equals(TARGET_PACKAGE)) {
+            XposedBridge.log(TAG + ": skip non-main process: " + lpparam.processName);
+            return;
+        }
+
+        XposedBridge.log(TAG + ": loaded in " + lpparam.packageName + " pid=" + android.os.Process.myPid());
 
         try {
             hookApplicationOnCreate(lpparam);
@@ -43,26 +51,61 @@ public class MainHook implements IXposedHookLoadPackage {
 
                     XposedBridge.log(TAG + ": Application.onCreate");
 
-                    PluginController.init(app, lpparam.classLoader);
+                    app.registerActivityLifecycleCallbacks(new Application.ActivityLifecycleCallbacks() {
+                        private boolean initialized = false;
 
-                    new Handler(Looper.getMainLooper()).postDelayed(() -> {
-                        try {
-                            installOkHttpHook(lpparam.classLoader);
-                        } catch (Throwable t) {
-                            XposedBridge.log(TAG + ": delayed OkHttp hook error: " + t.getMessage());
+                        @Override public void onActivityCreated(Activity a, Bundle b) {}
+                        @Override public void onActivityStarted(Activity a) {}
+                        @Override
+                        public void onActivityResumed(Activity a) {
+                            if (initialized) return;
+                            initialized = true;
+                            XposedBridge.log(TAG + ": first Activity resumed: " + a.getClass().getName());
+                            new Handler(Looper.getMainLooper()).postDelayed(() -> {
+                                try {
+                                    lateInit(app, lpparam.classLoader);
+                                } catch (Throwable t) {
+                                    XposedBridge.log(TAG + ": lateInit error: " + t.getMessage());
+                                }
+                            }, 3000);
                         }
-                        try {
-                            installJsonHook(lpparam.classLoader);
-                        } catch (Throwable t) {
-                            XposedBridge.log(TAG + ": delayed JSON hook error: " + t.getMessage());
-                        }
-                    }, 5000);
+                        @Override public void onActivityPaused(Activity a) {}
+                        @Override public void onActivityStopped(Activity a) {}
+                        @Override public void onActivitySaveInstanceState(Activity a, Bundle b) {}
+                        @Override public void onActivityDestroyed(Activity a) {}
+                    });
 
                 } catch (Throwable t) {
                     XposedBridge.log(TAG + ": FATAL in afterHookedMethod: " + t.getMessage());
                 }
             }
         });
+    }
+
+    private void lateInit(Application app, ClassLoader classLoader) {
+        XposedBridge.log(TAG + ": lateInit start");
+
+        try {
+            PluginController.init(app, classLoader);
+        } catch (Throwable t) {
+            XposedBridge.log(TAG + ": PluginController.init error: " + t.getMessage());
+        }
+
+        if (!hooksInstalled) {
+            hooksInstalled = true;
+            try {
+                installOkHttpHook(classLoader);
+            } catch (Throwable t) {
+                XposedBridge.log(TAG + ": OkHttp hook error: " + t.getMessage());
+            }
+            try {
+                installJsonHook(classLoader);
+            } catch (Throwable t) {
+                XposedBridge.log(TAG + ": JSON hook error: " + t.getMessage());
+            }
+        }
+
+        XposedBridge.log(TAG + ": lateInit done");
     }
 
     private void installOkHttpHook(ClassLoader classLoader) {
@@ -108,7 +151,8 @@ public class MainHook implements IXposedHookLoadPackage {
                     Method requestMethod = chainClass.getMethod("request");
                     Object request = requestMethod.invoke(chain);
 
-                    Method proceedMethod = chainClass.getMethod("proceed", XposedHelpers.findClass("okhttp3.Request", classLoader));
+                    Method proceedMethod = chainClass.getMethod("proceed",
+                            XposedHelpers.findClass("okhttp3.Request", classLoader));
                     Object response = proceedMethod.invoke(chain, request);
 
                     try {
@@ -134,7 +178,6 @@ public class MainHook implements IXposedHookLoadPackage {
 
         if (interceptors != null) {
             interceptors.add(proxy);
-            XposedBridge.log(TAG + ": interceptor injected");
         } else {
             XposedBridge.log(TAG + ": no interceptor list found on builder");
         }
