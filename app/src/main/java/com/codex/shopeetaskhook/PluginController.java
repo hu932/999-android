@@ -117,7 +117,8 @@ public class PluginController {
             @Override public void onActivityStarted(Activity a) {}
             @Override
             public void onActivityResumed(Activity a) {
-                ensureOverlay();
+                if (overlayCreated) return;
+                mainHandler.postDelayed(() -> ensureOverlay(), 1500);
             }
             @Override public void onActivityPaused(Activity a) {}
             @Override public void onActivityStopped(Activity a) {}
@@ -175,26 +176,30 @@ public class PluginController {
         if (overlayCreated) return;
 
         if (!Settings.canDrawOverlays(app)) {
-            try {
-                Runtime.getRuntime().exec(new String[]{"su", "-c",
-                        "appops set " + app.getPackageName() + " SYSTEM_ALERT_WINDOW allow"});
-                Thread.sleep(500);
-            } catch (Exception e) {
-                XposedBridge.log(TAG + ": overlay permission error: " + e.getMessage());
-            }
-
-            if (!Settings.canDrawOverlays(app)) {
-                XposedBridge.log(TAG + ": no overlay permission");
-                return;
-            }
+            executor.execute(() -> {
+                try {
+                    Process p = Runtime.getRuntime().exec(new String[]{"su", "-c",
+                            "appops set " + app.getPackageName() + " SYSTEM_ALERT_WINDOW allow"});
+                    p.waitFor();
+                } catch (Exception e) {
+                    XposedBridge.log(TAG + ": overlay permission error: " + e.getMessage());
+                }
+                mainHandler.postDelayed(this::ensureOverlay, 800);
+            });
+            return;
         }
 
         overlayCreated = true;
-        windowManager = (WindowManager) app.getSystemService(Context.WINDOW_SERVICE);
-        buildPanel();
-        buildBubble();
-        buildMiniView();
-        refreshUI();
+        try {
+            windowManager = (WindowManager) app.getSystemService(Context.WINDOW_SERVICE);
+            buildPanel();
+            buildBubble();
+            buildMiniView();
+            refreshUI();
+        } catch (Throwable t) {
+            overlayCreated = false;
+            XposedBridge.log(TAG + ": overlay build failed: " + t.getMessage());
+        }
     }
 
     private int dp(float dp) {
