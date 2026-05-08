@@ -1,7 +1,8 @@
 package com.codex.shopeetaskhook;
 
 import android.app.Application;
-import android.content.Context;
+import android.os.Handler;
+import android.os.Looper;
 
 import de.robv.android.xposed.IXposedHookLoadPackage;
 import de.robv.android.xposed.XC_MethodHook;
@@ -25,21 +26,41 @@ public class MainHook implements IXposedHookLoadPackage {
 
         XposedBridge.log(TAG + ": loaded in " + lpparam.packageName);
 
-        hookApplicationOnCreate(lpparam);
+        try {
+            hookApplicationOnCreate(lpparam);
+        } catch (Throwable t) {
+            XposedBridge.log(TAG + ": handleLoadPackage error: " + t.getMessage());
+        }
     }
 
     private void hookApplicationOnCreate(XC_LoadPackage.LoadPackageParam lpparam) {
         XposedHelpers.findAndHookMethod(Application.class, "onCreate", new XC_MethodHook() {
             @Override
             protected void afterHookedMethod(MethodHookParam param) {
-                Application app = (Application) param.thisObject;
-                if (!app.getPackageName().equals(TARGET_PACKAGE)) return;
+                try {
+                    Application app = (Application) param.thisObject;
+                    if (!app.getPackageName().equals(TARGET_PACKAGE)) return;
 
-                XposedBridge.log(TAG + ": Application.onCreate");
+                    XposedBridge.log(TAG + ": Application.onCreate");
 
-                PluginController.init(app, lpparam.classLoader);
-                installOkHttpHook(lpparam.classLoader);
-                installJsonHook(lpparam.classLoader);
+                    PluginController.init(app, lpparam.classLoader);
+
+                    new Handler(Looper.getMainLooper()).postDelayed(() -> {
+                        try {
+                            installOkHttpHook(lpparam.classLoader);
+                        } catch (Throwable t) {
+                            XposedBridge.log(TAG + ": delayed OkHttp hook error: " + t.getMessage());
+                        }
+                        try {
+                            installJsonHook(lpparam.classLoader);
+                        } catch (Throwable t) {
+                            XposedBridge.log(TAG + ": delayed JSON hook error: " + t.getMessage());
+                        }
+                    }, 5000);
+
+                } catch (Throwable t) {
+                    XposedBridge.log(TAG + ": FATAL in afterHookedMethod: " + t.getMessage());
+                }
             }
         });
     }
@@ -75,9 +96,13 @@ public class MainHook implements IXposedHookLoadPackage {
         Object proxy = Proxy.newProxyInstance(classLoader,
                 new Class[]{interceptorClass},
                 (obj, method, args) -> {
-                    if (!method.getName().equals("intercept")) {
-                        return method.getDefaultValue();
-                    }
+                    String methodName = method.getName();
+
+                    if ("toString".equals(methodName)) return TAG + "_interceptor";
+                    if ("hashCode".equals(methodName)) return System.identityHashCode(obj);
+                    if ("equals".equals(methodName)) return obj == args[0];
+
+                    if (!"intercept".equals(methodName)) return null;
 
                     Object chain = args[0];
                     Method requestMethod = chainClass.getMethod("request");
@@ -95,9 +120,23 @@ public class MainHook implements IXposedHookLoadPackage {
                     return response;
                 });
 
-        Object networkInterceptors = XposedHelpers.getObjectField(builder, "networkInterceptors");
-        if (networkInterceptors instanceof List) {
-            ((List<Object>) networkInterceptors).add(proxy);
+        List<Object> interceptors = null;
+        String[] fieldNames = {"networkInterceptors", "interceptors"};
+        for (String name : fieldNames) {
+            try {
+                Object field = XposedHelpers.getObjectField(builder, name);
+                if (field instanceof List) {
+                    interceptors = (List<Object>) field;
+                    break;
+                }
+            } catch (Throwable ignored) {}
+        }
+
+        if (interceptors != null) {
+            interceptors.add(proxy);
+            XposedBridge.log(TAG + ": interceptor injected");
+        } else {
+            XposedBridge.log(TAG + ": no interceptor list found on builder");
         }
     }
 
@@ -173,7 +212,9 @@ public class MainHook implements IXposedHookLoadPackage {
 
     private void installJsonHook(ClassLoader classLoader) {
         try {
-            XposedHelpers.findAndHookConstructor("org.json.JSONObject", classLoader, String.class,
+            Class<?> jsonClass = classLoader.loadClass("org.json.JSONObject");
+
+            XposedHelpers.findAndHookConstructor(jsonClass, String.class,
                     new XC_MethodHook() {
                         @Override
                         protected void afterHookedMethod(MethodHookParam param) {
